@@ -6,6 +6,16 @@ the sheet, and explains each one in the sidebar.
 
 Python does the counting, Gemini does the explaining.
 
+## Screenshots
+
+|  |  |
+|---|---|
+| ![Upload screen](screenshots/01-upload.png) | ![Marked-up sheet with the issue sidebar](screenshots/02-results.png) |
+| Drop a sheet in | Every mismatch is marked on the drawing and listed in the sidebar |
+
+![An issue expanded, showing the explanation and recommendation](screenshots/03-issue-detail.png)
+*Rules-only mode shown above — no `GEMINI_API_KEY` was set when these were taken. With a key configured, the sidebar also shows the AI-discovered issues (leader notes that disagree with the parts list, etc.) alongside these rule-based ones.*
+
 ```
 React + TypeScript (esbuild, no Vite)          FastAPI
 ┌───────────────────────────┐  multipart  ┌──────────────────────────────┐
