@@ -86,9 +86,16 @@ async def analyze(
         warnings.append(
             "No parts list was found on any sheet. A table with ITEM and QTY headings is required."
         )
-    if len(doc.sheets) > 1:
+    if len(doc.assemblies) > 1:
+        names = ", ".join(a.label for a in doc.assemblies)
         warnings.append(
-            f"{len(doc.sheets)} sheets were read. The parts list on sheet "
+            f"{len(doc.assemblies)} separate drawings were found in this PDF ({names}). "
+            "Each is checked against its own parts list — item 4 on one drawing is not "
+            "assumed to be item 4 on another."
+        )
+    elif len(doc.sheets) > 1:
+        warnings.append(
+            f"{len(doc.sheets)} sheets were read as one assembly. The parts list on sheet "
             f"{doc.master_page_index + 1} is treated as authoritative, and balloons from every "
             "sheet are checked against it."
         )
@@ -112,6 +119,16 @@ async def analyze(
         "sheets": sheets_out,
         "issues": issues,
         "summary": rules.summarise(issues),
+        "assemblies": [
+            {
+                "label": a.label,
+                "pages": [s.page_index for s in a.sheets],
+                "master_page_index": a.master_page_index,
+                "bom_rows": len(a.bom_rows),
+                "balloons": len(a.balloons),
+            }
+            for a in doc.assemblies
+        ],
         "split_balloons": doc.split_balloons,
         "split_inferred": doc.split_inferred,
         # Kept for frontend compatibility; the app no longer calls any AI service.

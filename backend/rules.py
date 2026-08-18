@@ -165,7 +165,36 @@ def _quantity_readings(blist: list[Balloon]) -> tuple[list[dict], list[Balloon],
 # main entry
 # --------------------------------------------------------------------------- #
 def run_rules(doc_or_sheet) -> list[dict[str, Any]]:
+    """Check each independent drawing in the PDF against its own parts list.
+
+    A multi-sheet PDF is often several separate assemblies, each numbering its
+    items from 1. Checking them against one shared parts list turned every item
+    into a conflict, so the extractor groups the sheets and this runs per group.
+    """
     doc = _as_document(doc_or_sheet)
+    groups = doc.assemblies or [doc]
+
+    issues: list[dict[str, Any]] = []
+    for group in groups:
+        found = _assembly_rules(group)
+        if len(groups) > 1:
+            for i in found:
+                i["assembly"] = group.label
+        issues.extend(found)
+
+    order = {ERROR: 0, WARNING: 1, INFO: 2}
+    issues.sort(key=lambda i: (
+        order[i["severity"]],
+        min(i["pages"]) if i["pages"] else 10 ** 6,
+        _numkey(i.get("item")),
+        i["code"],
+    ))
+    for idx, issue in enumerate(issues, 1):
+        issue["id"] = f"R{idx}"
+    return issues
+
+
+def _assembly_rules(doc: Document) -> list[dict[str, Any]]:
     master_page = doc.master_page_index
     issues: list[dict[str, Any]] = []
     n = 0
@@ -183,6 +212,7 @@ def run_rules(doc_or_sheet) -> list[dict[str, Any]]:
             "item": item,
             "targets": targets,
             "pages": pages,
+            "assembly": "",
             "recommendation": fix,
             "evidence": evidence or {},
             "source": "rule",
@@ -275,13 +305,25 @@ def run_rules(doc_or_sheet) -> list[dict[str, Any]]:
                 "part that was never removed.",
                 _row_target(row, master_page), item=item,
                 fix="Delete the row, or restore the correct quantity.")
-        if EMIT_NOTES and not row.part_number and not row.description:
-            add("BOM_ROW_INCOMPLETE", WARNING,
-                f"Item {item} has no part number or description",
-                f"Row {item} was read with neither a part number nor a description, so it "
-                "cannot be identified.",
-                _row_target(row, master_page), item=item,
-                fix="Fill in the part number and description, or check the row is machine-readable.")
+    if EMIT_NOTES:
+        blank = [r for r in bom_by_item.values() if not r.part_number and not r.description]
+        if len(blank) > 3:
+            items = ", ".join(str(r.item) for r in blank[:12]) + ("  …" if len(blank) > 12 else "")
+            add("BOM_ROWS_UNREADABLE", WARNING,
+                f"{len(blank)} parts-list rows have no part number or description",
+                f"Items {items} were read with neither a part number nor a description. The item "
+                "numbers and quantities were still read, so the balloon checks below are valid, "
+                "but those rows could not be identified.",
+                [t for r in blank[:12] for t in _row_target(r, master_page)],
+                fix="Check the parts list columns are real text, not outlines or an image.")
+        else:
+            for r in blank:
+                add("BOM_ROW_INCOMPLETE", WARNING,
+                    f"Item {r.item} has no part number or description",
+                    f"Row {r.item} was read with neither a part number nor a description, so it "
+                    "cannot be identified.",
+                    _row_target(r, master_page), item=str(r.item),
+                    fix="Fill in the part number and description, or check the row reads as text.")
 
     # ---- balloon <-> row coverage ---------------------------------------- #
     if have_bom:
@@ -499,10 +541,6 @@ def run_rules(doc_or_sheet) -> list[dict[str, Any]]:
                 f"({shown}).",
                 [], fix="Renumber consecutively, or confirm the gaps are intentional.")
 
-    order = {ERROR: 0, WARNING: 1, INFO: 2}
-    issues.sort(key=lambda i: (order[i["severity"]], _numkey(i.get("item")), i["code"]))
-    for idx, issue in enumerate(issues, 1):
-        issue["id"] = f"R{idx}"
     return issues
 
 

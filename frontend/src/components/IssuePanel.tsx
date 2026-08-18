@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
-import type { AnalysisResult, Issue, Severity } from "../types";
+import type { AnalysisResult, Issue, QtyReading, Severity } from "../types";
+import { sheetAt, sheetsOf } from "../types";
 
 interface Props {
   result: AnalysisResult;
@@ -8,7 +9,8 @@ interface Props {
   onToggleFilter: (s: Severity) => void;
   selectedId: string | null;
   onSelect: (id: string | null) => void;
-  activeSheet?: number; // highlight issues on the current sheet
+  activeSheet?: number;
+  onSheetChange?: (pageIndex: number) => void;
 }
 
 const SEVERITY_LABEL: Record<Severity, string> = {
@@ -16,6 +18,63 @@ const SEVERITY_LABEL: Record<Severity, string> = {
   warning: "Warnings",
   info: "Notes",
 };
+
+/** The arithmetic behind a quantity verdict, so the call can be checked. */
+function Readings({ readings, bomQty, matched }: {
+  readings: QtyReading[];
+  bomQty?: number;
+  matched: string[];
+}) {
+  return (
+    <span style={{ display: "block", marginTop: "0.6rem" }}>
+      <strong style={{ display: "block", marginBottom: "0.25rem" }}>
+        How the callouts add up
+      </strong>
+      <span style={{ display: "block" }}>
+        {readings.map((r) => {
+          const hit = matched.includes(r.key);
+          return (
+            <span
+              key={r.key}
+              style={{
+                display: "flex",
+                gap: 8,
+                alignItems: "baseline",
+                padding: "2px 0",
+                fontSize: "0.78rem",
+                color: hit ? "#166534" : "inherit",
+                fontWeight: hit ? 600 : 400,
+              }}
+            >
+              <span className="mono" style={{ minWidth: "2.2rem" }}>{r.value}</span>
+              <span>
+                {r.label}
+                {r.breakdown !== String(r.value) && ` — ${r.breakdown}`}
+                {hit && " ✓ matches the parts list"}
+              </span>
+            </span>
+          );
+        })}
+        {typeof bomQty === "number" && (
+          <span
+            style={{
+              display: "flex",
+              gap: 8,
+              alignItems: "baseline",
+              padding: "4px 0 0",
+              fontSize: "0.78rem",
+              borderTop: "1px solid rgba(0,0,0,0.08)",
+              marginTop: 4,
+            }}
+          >
+            <span className="mono" style={{ minWidth: "2.2rem" }}>{bomQty}</span>
+            <span>parts list</span>
+          </span>
+        )}
+      </span>
+    </span>
+  );
+}
 
 export default function IssuePanel({
   result,
@@ -25,10 +84,11 @@ export default function IssuePanel({
   selectedId,
   onSelect,
   activeSheet,
+  onSheetChange,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
 
-  // keep the selected card visible when selection comes from a marker click
+  // Keep the selected card visible when the selection comes from a marker click.
   useEffect(() => {
     if (!selectedId) return;
     listRef.current
@@ -39,12 +99,14 @@ export default function IssuePanel({
   const { summary, ai } = result;
   const clean = summary.error === 0 && summary.warning === 0;
 
-  // Document-wide figures (across every sheet) with the master as fallback.
-  const sheets = result.sheets ?? [result.sheet];
-  const master = sheets[result.master_page_index] ?? result.sheet;
+  const sheets = sheetsOf(result);
+  const master = sheetAt(result, result.master_page_index);
   const totalBalloons = sheets.reduce((n, s) => n + s.balloons.length, 0);
-  const bomRowCount = master.bom_rows.length;
   const drawingNo = master.title_block?.drawing_no ?? "\u2014";
+  const multi = (result.assemblies?.length ?? 0) > 1;
+  const bomRowCount = multi
+    ? result.assemblies.reduce((n, a) => n + a.bom_rows, 0)
+    : master.bom_rows.filter((r) => r.item !== null).length;
 
   return (
     <aside className="sidebar">
@@ -66,20 +128,16 @@ export default function IssuePanel({
         <div className="stamp-row">
           <div className="stamp-cell">
             <dt>Balloons</dt>
-            <dd className="mono" style={{ fontSize: "1rem" }}>
-              {totalBalloons}
-            </dd>
+            <dd className="mono" style={{ fontSize: "1rem" }}>{totalBalloons}</dd>
           </div>
           <div className="stamp-cell">
             <dt>Parts list rows</dt>
-            <dd className="mono" style={{ fontSize: "1rem" }}>
-              {bomRowCount}
-            </dd>
+            <dd className="mono" style={{ fontSize: "1rem" }}>{bomRowCount}</dd>
           </div>
           <div className="stamp-cell">
-            <dt>{sheets.length > 1 ? "Sheets" : "Drawing no."}</dt>
-            <dd className="mono" style={{ fontSize: sheets.length > 1 ? "1rem" : "0.85rem" }}>
-              {sheets.length > 1 ? sheets.length : drawingNo}
+            <dt>{multi ? "Drawings" : "Drawing no."}</dt>
+            <dd className="mono" style={{ fontSize: multi ? "1rem" : "0.85rem" }}>
+              {multi ? `${result.assemblies.length} / ${sheets.length} sh` : drawingNo}
             </dd>
           </div>
         </div>
@@ -100,14 +158,19 @@ export default function IssuePanel({
         </div>
       </div>
 
+      {result.split_balloons && (
+        <p className="banner">
+          Split balloons: the lower figure is read as the quantity at that place.
+          {result.split_inferred && " Assumed from the callouts — no note on the drawing says so."}
+        </p>
+      )}
+
       {ai.status === "error" || ai.status === "unavailable" ? (
         <p className="banner">{ai.message}</p>
       ) : null}
 
       {result.warnings.map((w) => (
-        <p className="banner" key={w}>
-          {w}
-        </p>
+        <p className="banner" key={w}>{w}</p>
       ))}
 
       <div className="filters">
@@ -134,39 +197,60 @@ export default function IssuePanel({
         ) : (
           issues.map((issue, index) => {
             const selected = issue.id === selectedId;
-            const issuePage = issue.targets[0]?.page;
-            const onThisSheet =
-              typeof activeSheet === "number" &&
-              issue.targets.some((t) => t.page === activeSheet);
+            const pages = issue.pages?.length
+              ? issue.pages
+              : Array.from(new Set(issue.targets.map((t) => t.page)));
+            const readings = issue.evidence?.readings ?? [];
             return (
-              <button
+              <div
                 key={issue.id}
-                type="button"
                 data-issue={issue.id}
                 className={`issue sev-${issue.severity}${selected ? " selected" : ""}`}
-                onClick={() => onSelect(selected ? null : issue.id)}
+                role="button"
+                tabIndex={0}
                 aria-expanded={selected}
+                onClick={() => onSelect(selected ? null : issue.id)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    onSelect(selected ? null : issue.id);
+                  }
+                }}
               >
                 <span className="issue-head">
                   <span className="issue-index mono">{index + 1}</span>
                   <span className="issue-title">{issue.title}</span>
                 </span>
                 <span className="issue-meta">
+                  {issue.assembly && <span className="tag">{issue.assembly}</span>}
                   <span className="tag">{issue.code}</span>
                   {issue.item && <span className="tag">Item {issue.item}</span>}
-                  {(sheets.length > 1 && typeof issuePage === "number") && (
-                    <span
-                      className="tag"
-                      style={onThisSheet ? { background: "#2563eb", color: "#fff" } : undefined}
-                    >
-                      Sheet {issuePage + 1}
-                    </span>
-                  )}
+                  {sheets.length > 1 &&
+                    pages.map((p) => (
+                      <span
+                        key={p}
+                        className="tag"
+                        style={p === activeSheet ? { background: "#2563eb", color: "#fff" } : undefined}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onSheetChange?.(p);
+                        }}
+                      >
+                        Sheet {p + 1}
+                      </span>
+                    ))}
                   {issue.source !== "rule" && <span className="tag ai">AI</span>}
                 </span>
                 {selected && (
                   <span className="issue-detail">
                     <p>{issue.detail}</p>
+                    {readings.length > 0 && (
+                      <Readings
+                        readings={readings}
+                        bomQty={issue.evidence?.bom_qty}
+                        matched={issue.evidence?.matched ?? []}
+                      />
+                    )}
                     {issue.recommendation && (
                       <span className="issue-fix">
                         <strong>What to do</strong>
@@ -175,7 +259,7 @@ export default function IssuePanel({
                     )}
                   </span>
                 )}
-              </button>
+              </div>
             );
           })
         )}

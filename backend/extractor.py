@@ -43,7 +43,11 @@ DEDUPE_CENTRE_TOL = 3.0       # two outlines this close are one balloon
 # --- balloon / BOM text ---------------------------------------------------- #
 ITEM_RE = re.compile(r"^\d{1,4}$")
 REF_RE = re.compile(r"\bREF\b", re.I)
-_PN_CODE_RE = re.compile(r"[0-9][0-9\-]{3,}")
+# A code-like part number: a digit plus a separator, e.g. 100-2201,
+# CTN-2400-001, BUS-1500-003. Letters are allowed because most real part
+# numbers carry a prefix; the salvage pass only accepts a code sitting
+# immediately right of an item number, which keeps stray codes out.
+_PN_CODE_RE = re.compile(r"(?=[A-Z0-9\-/]*\d)[A-Z0-9]{1,6}[\-/][A-Z0-9\-/]{2,}", re.I)
 
 # Imperial fractions that must never be read as item/qty (1/2", 3/16", ...)
 _FRACTION_DENOMS = {2, 3, 4, 8, 16, 32, 64}
@@ -221,13 +225,25 @@ class Document:
     split_inferred: bool = False
     duplicate_rows: dict[str, list[BomRow]] = field(default_factory=dict)
     row_conflicts: dict[str, list[BomRow]] = field(default_factory=dict)
+    assemblies: list["Document"] = field(default_factory=list, repr=False)
     page_image_b64: str = ""
 
     @property
+    def label(self) -> str:
+        """How this assembly is named in the issue list."""
+        m = self.master
+        dwg = m.title_block.get("drawing_no") if m else None
+        return dwg or (f"Sheet {m.page_index + 1}" if m else "Drawing")
+
+    @property
     def master(self) -> Sheet | None:
+        """Looked up by page index: an assembly holds a subset of the sheets."""
         if not self.sheets:
             return None
-        return self.sheets[min(self.master_page_index, len(self.sheets) - 1)]
+        for s in self.sheets:
+            if s.page_index == self.master_page_index:
+                return s
+        return self.sheets[0]
 
     def to_dict(self) -> dict[str, Any]:
         m = self.master
@@ -331,7 +347,7 @@ def _shape_candidates(page, exclude: list[Box]) -> list[dict]:
         if ratio < (RECT_MIN_RATIO if kind == "rect" else BALLOON_MIN_RATIO):
             continue
         box = Box(o["x0"], o["top"], o["x1"], o["bottom"])
-        if any(t.contains(box, pad=2.0) for t in exclude):
+        if kind == "rect" and any(t.contains(box, pad=2.0) for t in exclude):
             continue           # inside the parts list: a table cell, not a balloon
         out.append({"box": box, "kind": kind, "area": w * h})
 
@@ -344,6 +360,10 @@ def _shape_candidates(page, exclude: list[Box]) -> list[dict]:
                and abs(b.cy - k["box"].cy) < DEDUPE_CENTRE_TOL for k in kept):
             continue
         if any(k["box"].contains(b, pad=0.5) for k in kept):
+            continue
+        # centre swallowed by a larger outline already kept -> same balloon
+        if any(k["box"].x0 <= b.cx <= k["box"].x1 and k["box"].y0 <= b.cy <= k["box"].y1
+               for k in kept):
             continue
         kept.append(c)
     kept.sort(key=lambda c: (c["box"].y0, c["box"].x0))
@@ -423,6 +443,10 @@ def find_balloons(page, words: list[dict], page_index: int = 0,
             utxt, ltxt = ltxt, ""
 
         item, qty, qty_raw, is_ref = _parse_balloon_content(utxt, ltxt, allow_dash)
+        if cand["kind"] == "rect":
+            flat = re.sub(r"\s+", "", REF_RE.sub("", f"{utxt}{ltxt}"))
+            if not _RECT_BALLOON_RE.match(flat):
+                continue
 
         r = max((box.x1 - box.x0), (box.y1 - box.y0)) / 2
         near = [w["text"] for w in words
@@ -622,13 +646,15 @@ def _assign_roles(columns: list[dict]) -> None:
         claim(min(seqd or pos, key=lambda c: c["x0"]), "item")
     else:
         pos = [c for c in columns if c["role"] is None and c["_seq"]
-               and c["_pure_int_frac"] >= 0.6 and c["_avg_len"] <= 4]
+               and c["_pure_int_frac"] >= 0.6 and c["_avg_len"] <= 4
+               and "qty" not in c["hints"]]
         if pos:
             claim(min(pos, key=lambda c: c["x0"]), "item")
 
     if "item" not in taken:
         pos = [c for c in columns if c["role"] is None and c["_pure_int_frac"] >= 0.6
-               and c["_avg_len"] <= 4 and c["_nonblank"] >= 1]
+               and c["_avg_len"] <= 4 and c["_nonblank"] >= 1
+               and "qty" not in c["hints"]]
         if pos:
             claim(min(pos, key=lambda c: c["x0"]), "item")
 
@@ -713,17 +739,22 @@ def _extract_with_pdfplumber(page):
             info = _parse_pdfplumber_table(t, want_meta=True)
             if info is None:
                 continue
-            data_rows = sum(1 for r in info[0] if r.item is not None)
-            parsed.append((data_rows, info, t))
+            rows_ = info[0]
+            data_rows = sum(1 for r in rows_ if r.item is not None)
+            roles = set(info[4].values())
+            # a real parts list names its items and identifies its parts
+            quality = ("item" in roles) * 2 + ("part_number" in roles) + ("qty" in roles)
+            named = sum(1 for r in rows_ if r.part_number or r.description)
+            parsed.append(((quality, data_rows, named), info, t))
         if not parsed:
             continue
 
         parsed.sort(key=lambda p: p[0], reverse=True)
-        _, (rows, total, tbbox, spans, roles, header_y), primary = parsed[0]
+        _, (rows, total, tbbox, spans, role_map, header_y), primary = parsed[0]
         merged = list(rows)
 
         for _, _, t in parsed[1:]:
-            for r in _parse_continuation_table(t, spans, roles, header_y):
+            for r in _parse_continuation_table(t, spans, role_map, header_y):
                 if not _row_seen(merged, r):
                     merged.append(r)
 
@@ -1008,14 +1039,40 @@ def _extract_text_anchored(page, words: list[dict]):
     return rows, stated_total, total_bbox, True, span
 
 
+MAX_EXCLUDE_AREA = 0.55   # a "table" bigger than this is the drawing frame, not a BOM
+
+
+def _bom_region(rows: list[BomRow], total_bbox: Box | None,
+                page_w: float, page_h: float) -> list[Box]:
+    """The area the parsed parts list actually occupies.
+
+    pdfplumber reports the drawing border as a table covering ~90% of an A3
+    sheet. Excluding that from balloon detection wiped out every balloon on the
+    sheet, so the exclusion zone is built from the rows we really parsed and is
+    dropped entirely if it still swallows most of the page.
+    """
+    boxes = [r.bbox for r in rows if r.bbox is not None]
+    if total_bbox is not None:
+        boxes.append(total_bbox)
+    if not boxes:
+        return []
+    span = Box(min(b.x0 for b in boxes), min(b.y0 for b in boxes),
+               max(b.x1 for b in boxes), max(b.y1 for b in boxes))
+    area = (span.x1 - span.x0) * (span.y1 - span.y0)
+    if page_w and page_h and area > MAX_EXCLUDE_AREA * page_w * page_h:
+        return []
+    return [span]
+
+
 def find_bom(page, words: list[dict]):
-    """-> (rows, stated_total, total_bbox, detected, table_boxes)"""
-    rows, total, tbbox, ok, boxes = _extract_with_pdfplumber(page)
+    """-> (rows, stated_total, total_bbox, detected, exclusion_boxes)"""
+    pw, ph = float(page.width), float(page.height)
+    rows, total, tbbox, ok, _ = _extract_with_pdfplumber(page)
     if ok:
-        return rows, total, tbbox, True, boxes
-    rows, total, tbbox, ok, boxes = _extract_text_anchored(page, words)
+        return rows, total, tbbox, True, _bom_region(rows, tbbox, pw, ph)
+    rows, total, tbbox, ok, _ = _extract_text_anchored(page, words)
     if ok:
-        return rows, total, tbbox, True, boxes
+        return rows, total, tbbox, True, _bom_region(rows, tbbox, pw, ph)
     return [], None, None, False, []
 
 
@@ -1054,7 +1111,37 @@ def find_notes(page) -> list[str]:
     return notes[:20]
 
 
-def find_title_block(page) -> dict[str, str]:
+# A rectangle only counts as a balloon if it holds a clean callout, never a date
+# or a code out of the revision block.
+_RECT_BALLOON_RE = re.compile(r"^\d{1,4}(?:\s*[/|(\-]\s*\d{1,4}\)?)?$")
+
+
+_DWG_CODE_RE = re.compile(r"^(?=[A-Z0-9\-/]*\d)[A-Z0-9][A-Z0-9\-/]{4,}$")
+
+
+def _drawing_no_below_label(words: list[dict]) -> str | None:
+    """Title blocks stack the value under the label, so a flat-text regex reads
+    the neighbouring cell instead. Find the label, then look directly beneath."""
+    labels = []
+    for line in _group_lines(words):
+        for i, w in enumerate(line):
+            t = w["text"].upper().strip(":.")
+            prev = line[i - 1]["text"].upper() if i else ""
+            if t in {"NUMBER", "NO", "NO."} and prev in {"DRAWING", "DWG", "DWG."}:
+                labels.append(w)
+    for label in labels:
+        lx0, lx1 = label["x0"] - 40, label["x1"] + 40
+        below = [w for w in words
+                 if w["top"] > label["bottom"] - 1
+                 and w["top"] - label["bottom"] < 40
+                 and w["x1"] > lx0 and w["x0"] < lx1
+                 and _DWG_CODE_RE.match(w["text"].upper().strip())]
+        if below:
+            return min(below, key=lambda w: w["top"])["text"].upper().strip()
+    return None
+
+
+def find_title_block(page, words: list[dict] | None = None) -> dict[str, str]:
     text = (page.extract_text() or "").upper()
     tb: dict[str, str] = {}
     for label, pattern in (
@@ -1066,6 +1153,10 @@ def find_title_block(page) -> dict[str, str]:
         m = re.search(pattern, text)
         if m:
             tb[label] = m.group(1).strip()
+    if "drawing_no" not in tb and words:
+        found = _drawing_no_below_label(words)
+        if found:
+            tb["drawing_no"] = found
     return tb
 
 
@@ -1106,6 +1197,21 @@ def render_page(pdf_bytes: bytes, page_index: int = 0, dpi: int = RENDER_DPI) ->
 # --------------------------------------------------------------------------- #
 # per-page parse
 # --------------------------------------------------------------------------- #
+def _repair_clipped_cells(rows: list[BomRow], words: list[dict]) -> None:
+    """Grid columns sometimes cut through a token, so 'RCK-310-001A' is read as
+    'K-310-001A'. Put the whole word back when one clearly ends with the cell."""
+    for r in rows:
+        if not r.part_number or r.bbox is None:
+            continue
+        band = [w for w in words
+                if r.bbox.y0 - 1 <= (w["top"] + w["bottom"]) / 2 <= r.bbox.y1 + 1]
+        for w in band:
+            t = w["text"].strip()
+            if len(t) > len(r.part_number) and t.endswith(r.part_number):
+                r.part_number = t
+                break
+
+
 def _parse_page(page, page_index: int) -> Sheet:
     words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
     rows, total, total_bbox, detected, table_boxes = find_bom(page, words)
@@ -1119,6 +1225,7 @@ def _parse_page(page, page_index: int) -> Sheet:
     views = find_views(words)
     assign_views(balloons, views, float(page.width), float(page.height))
 
+    _repair_clipped_cells(rows, words)
     for r in rows:
         r.page_index = page_index
 
@@ -1131,7 +1238,7 @@ def _parse_page(page, page_index: int) -> Sheet:
         stated_total=total,
         stated_total_bbox=total_bbox,
         notes=find_notes(page),
-        title_block=find_title_block(page),
+        title_block=find_title_block(page, words),
         views=views,
         bom_detected=detected,
         bom_is_extract=_detect_bom_extract(page),
@@ -1341,48 +1448,115 @@ def _infer_split(sheets: list[Sheet], bom_by_item: dict[str, BomRow]) -> bool:
     return False
 
 
-def parse_document(pdf_bytes: bytes, filename: str = "", render: bool = False) -> Document:
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        sheets = [_parse_page(page, i) for i, page in enumerate(pdf.pages)]
+def _items_conflict(group: list[Sheet], sheet: Sheet) -> bool:
+    """Do this sheet's item numbers already mean something else in this group?"""
+    prev: dict[str, BomRow] = {}
+    for g in group:
+        for r in g.bom_rows:
+            if r.item is not None:
+                prev.setdefault(str(r.item), r)
+    shared = clash = 0
+    for r in sheet.bom_rows:
+        old = prev.get(str(r.item)) if r.item is not None else None
+        if old is None:
+            continue
+        shared += 1
+        a, b = _norm(old.part_number), _norm(r.part_number)
+        if a and b and a != b:
+            clash += 1
+        elif not (a or b) and _norm(old.description) != _norm(r.description):
+            clash += 1
+    return shared >= 3 and clash / shared >= 0.5
 
-    def bom_score(s: Sheet) -> tuple[int, int]:
-        data_rows = sum(1 for r in s.bom_rows if r.item is not None)
-        return (0 if s.bom_is_extract else 1, data_rows)
 
-    candidates = [s for s in sheets if s.bom_detected and any(r.item for r in s.bom_rows)]
-    master = max(candidates, key=bom_score) if candidates else (sheets[0] if sheets else None)
-    master_idx = master.page_index if master else 0
+def _group_assemblies(sheets: list[Sheet]) -> list[list[Sheet]]:
+    """Split the PDF into independent drawings.
 
-    all_balloons: list[Balloon] = []
+    A six-sheet PDF is often six separate assemblies, each with its own title
+    block and its own parts list numbered from 1 — not one assembly spread over
+    six sheets. Reconciling those against a single master turns every item into
+    a conflict, so a sheet starts a new assembly when it carries its own full
+    parts list AND either the drawing number changes or its item numbers already
+    mean something else in the current group.
+    """
+    groups: list[list[Sheet]] = []
     for s in sheets:
-        all_balloons.extend(s.balloons)
+        owns_bom = (s.bom_detected and not s.bom_is_extract
+                    and any(r.item is not None for r in s.bom_rows))
+        if not groups:
+            groups.append([s])
+            continue
+        current = groups[-1]
+        prev_dwg = next((g.title_block.get("drawing_no") for g in reversed(current)
+                         if g.title_block.get("drawing_no")), None)
+        dwg = s.title_block.get("drawing_no")
+        new_drawing = bool(dwg and prev_dwg and dwg != prev_dwg)
+        if owns_bom and (new_drawing or _items_conflict(current, s)):
+            groups.append([s])
+        else:
+            current.append(s)
+    return groups
 
-    _salvage_missing_bom_items(master, all_balloons)
 
-    reconciled, duplicates, conflicts = _reconcile_bom(sheets, master)
+def _build_assembly(group: list[Sheet], filename: str) -> Document:
+    def bom_score(s: Sheet) -> tuple[int, int]:
+        return (0 if s.bom_is_extract else 1,
+                sum(1 for r in s.bom_rows if r.item is not None))
+
+    candidates = [s for s in group
+                  if s.bom_detected and any(r.item is not None for r in s.bom_rows)]
+    master = max(candidates, key=bom_score) if candidates else group[0]
+
+    balloons = [b for s in group for b in s.balloons]
+    _salvage_missing_bom_items(master, balloons)
+    reconciled, duplicates, conflicts = _reconcile_bom(group, master)
     bom_by_item = {str(r.item): r for r in reconciled if r.item is not None}
 
-    hinted = any(s.split_balloons for s in sheets)
-    inferred = False if hinted else _infer_split(sheets, bom_by_item)
+    hinted = any(s.split_balloons for s in group)
+    inferred = False if hinted else _infer_split(group, bom_by_item)
 
-    doc = Document(
+    return Document(
         filename=filename,
-        sheets=sheets,
-        master_page_index=master_idx,
+        sheets=group,
+        master_page_index=master.page_index,
         bom_rows=reconciled,
-        raw_bom_rows=[r for s in sheets for r in s.bom_rows if r.item is not None],
-        balloons=all_balloons,
-        stated_total=master.stated_total if master else None,
-        stated_total_bbox=master.stated_total_bbox if master else None,
+        raw_bom_rows=[r for s in group for r in s.bom_rows if r.item is not None],
+        balloons=balloons,
+        stated_total=master.stated_total,
+        stated_total_bbox=master.stated_total_bbox,
         split_balloons=hinted or inferred,
         split_inferred=inferred,
         duplicate_rows=duplicates,
         row_conflicts=conflicts,
     )
 
+
+def parse_document(pdf_bytes: bytes, filename: str = "", render: bool = False) -> Document:
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        sheets = [_parse_page(page, i) for i, page in enumerate(pdf.pages)]
+
+    assemblies = [_build_assembly(g, filename) for g in _group_assemblies(sheets)]
+    primary = max(assemblies, key=lambda a: len(a.bom_rows)) if assemblies else None
+
+    doc = Document(
+        filename=filename,
+        sheets=sheets,
+        master_page_index=primary.master_page_index if primary else 0,
+        bom_rows=primary.bom_rows if primary else [],
+        raw_bom_rows=[r for s in sheets for r in s.bom_rows if r.item is not None],
+        balloons=[b for s in sheets for b in s.balloons],
+        stated_total=primary.stated_total if primary else None,
+        stated_total_bbox=primary.stated_total_bbox if primary else None,
+        split_balloons=any(a.split_balloons for a in assemblies),
+        split_inferred=any(a.split_inferred for a in assemblies),
+        duplicate_rows=primary.duplicate_rows if primary else {},
+        row_conflicts=primary.row_conflicts if primary else {},
+        assemblies=assemblies,
+    )
+
     if render:
         images = render_pages(pdf_bytes, [s.page_index for s in sheets])
         for s in sheets:
             s.page_image_b64 = images.get(s.page_index, "")
-        doc.page_image_b64 = images.get(master_idx, "")
+        doc.page_image_b64 = images.get(doc.master_page_index, "")
     return doc
