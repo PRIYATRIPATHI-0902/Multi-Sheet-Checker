@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { analyze } from "./api";
 import Dropzone from "./components/Dropzone";
 import IssuePanel from "./components/IssuePanel";
@@ -12,16 +12,18 @@ export default function App() {
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [useAi, setUseAi] = useState(true);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [filters, setFilters] = useState<Set<Severity>>(new Set(ALL));
+  const [activeSheet, setActiveSheet] = useState(0); // which sheet is shown
 
-  const run = async (f: File, ai: boolean) => {
+  const run = async (f: File) => {
     setBusy(true);
     setError(null);
     setSelectedId(null);
     try {
-      setResult(await analyze(f, { page: 0, useAi: ai }));
+      const r = await analyze(f);
+      setResult(r);
+      setActiveSheet(r.master_page_index ?? 0); // land on the sheet that owns the BOM
       setFile(f);
     } catch (e) {
       setError(e instanceof Error ? e.message : "The check could not be completed.");
@@ -35,6 +37,14 @@ export default function App() {
     () => (result ? result.issues.filter((i) => filters.has(i.severity)) : []),
     [result, filters]
   );
+
+  // When an issue is selected, jump to the sheet its first marker lives on.
+  useEffect(() => {
+    if (!selectedId || !result) return;
+    const issue = result.issues.find((i) => i.id === selectedId);
+    const page = issue?.targets?.[0]?.page;
+    if (typeof page === "number") setActiveSheet(page);
+  }, [selectedId, result]);
 
   const toggleFilter = (s: Severity) => {
     setFilters((prev) => {
@@ -55,25 +65,13 @@ export default function App() {
         </div>
         {file && <span className="topbar-file">{file.name}</span>}
         <span className="topbar-spacer" />
-
         <div className="topbar-actions">
-          <label className="toggle">
-            <input
-              type="checkbox"
-              checked={useAi}
-              onChange={(e) => {
-                setUseAi(e.target.checked);
-                if (file) void run(file, e.target.checked);
-              }}
-            />
-            AI review
-          </label>
           {result && (
             <>
               <button
                 type="button"
                 className="btn btn-ghost"
-                onClick={() => file && void run(file, useAi)}
+                onClick={() => file && void run(file)}
                 disabled={busy}
               >
                 Re-check
@@ -102,6 +100,8 @@ export default function App() {
               issues={visible}
               selectedId={selectedId}
               onSelect={setSelectedId}
+              activeSheet={activeSheet}
+              onSheetChange={setActiveSheet}
             />
             <IssuePanel
               result={result}
@@ -110,18 +110,17 @@ export default function App() {
               onToggleFilter={toggleFilter}
               selectedId={selectedId}
               onSelect={setSelectedId}
+              activeSheet={activeSheet}
             />
           </>
         ) : (
-          <Dropzone onFile={(f) => void run(f, useAi)} error={error} />
+          <Dropzone onFile={(f) => void run(f)} error={error} />
         )}
 
         {busy && (
           <div className="overlay">
             <div className="progress">
-              <span className="label">
-                {useAi ? "Reading the sheet, then asking Gemini" : "Reading the sheet"}
-              </span>
+              <span className="label">Reading the sheets</span>
               <span className="bar">
                 <i />
               </span>

@@ -6,19 +6,32 @@ interface Props {
   issues: Issue[];
   selectedId: string | null;
   onSelect: (id: string | null) => void;
+  activeSheet: number;
+  onSheetChange: (i: number) => void;
 }
 
 const PAD = 3; // points of breathing room drawn around each marker
 const GUTTER = 24; // .canvas-scroll padding, in px
 
-export default function SheetView({ result, issues, selectedId, onSelect }: Props) {
+export default function SheetView({
+  result,
+  issues,
+  selectedId,
+  onSelect,
+  activeSheet,
+  onSheetChange,
+}: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [fitZoom, setFitZoom] = useState(1);
   /** null means "follow the fit zoom"; a number is an explicit user choice. */
   const [userZoom, setUserZoom] = useState<number | null>(null);
   const [dragging, setDragging] = useState(false);
 
-  const { page_width: pw, page_height: ph } = result.sheet;
+  // Support both the new multi-sheet shape and the old single-sheet payload.
+  const sheets = result.sheets ?? [result.sheet];
+  const sheet = sheets[activeSheet] ?? sheets[0];
+  const pw = sheet.page_width;
+  const ph = sheet.page_height;
   const zoom = userZoom ?? fitZoom;
 
   useLayoutEffect(() => {
@@ -31,30 +44,35 @@ export default function SheetView({ result, issues, selectedId, onSelect }: Prop
     return () => ro.disconnect();
   }, [pw]);
 
-  // a newly loaded sheet always starts fitted
-  useEffect(() => setUserZoom(null), [result.page_image]);
+  // a newly loaded / switched sheet always starts fitted
+  useEffect(() => setUserZoom(null), [sheet.page_image]);
+
+  // number of visible issues that place a marker on each sheet (for the tabs)
+  const perSheet = sheets.map(
+    (s) => issues.filter((i) => i.targets.some((t) => t.page === s.page_index)).length
+  );
 
   // bring the selected marker into view
   useEffect(() => {
     const scroller = scrollRef.current;
     if (!selectedId || !scroller) return;
     const issue = issues.find((i) => i.id === selectedId);
-    if (!issue?.targets.length) return;
-
-    const [x0, y0, x1, y1] = issue.targets[0].bbox;
+    const target =
+      issue?.targets.find((t) => t.page === activeSheet) ?? issue?.targets[0];
+    if (!target) return;
+    const [x0, y0, x1, y1] = target.bbox;
     scroller.scrollTo({
       left: ((x0 + x1) / 2) * zoom + GUTTER - scroller.clientWidth / 2,
       top: ((y0 + y1) / 2) * zoom + GUTTER - scroller.clientHeight / 2,
       behavior: "smooth",
     });
-  }, [selectedId, issues, zoom]);
+  }, [selectedId, issues, zoom, activeSheet]);
 
   // drag anywhere on the sheet to pan
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     let startX = 0, startY = 0, left = 0, top = 0, active = false;
-
     const down = (e: MouseEvent) => {
       if ((e.target as HTMLElement).closest(".marker")) return;
       active = true;
@@ -73,7 +91,6 @@ export default function SheetView({ result, issues, selectedId, onSelect }: Prop
       active = false;
       setDragging(false);
     };
-
     el.addEventListener("mousedown", down);
     window.addEventListener("mousemove", move);
     window.addEventListener("mouseup", up);
@@ -89,6 +106,72 @@ export default function SheetView({ result, issues, selectedId, onSelect }: Prop
 
   return (
     <div className="canvas">
+      {sheets.length > 1 && (
+        <div
+          style={{
+            display: "flex",
+            gap: 6,
+            padding: "8px 12px",
+            flexWrap: "wrap",
+            borderBottom: "1px solid rgba(0,0,0,0.08)",
+            background: "rgba(0,0,0,0.02)",
+          }}
+        >
+          {sheets.map((s, i) => {
+            const on = i === activeSheet;
+            return (
+              <button
+                key={s.page_index}
+                type="button"
+                onClick={() => onSheetChange(i)}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                  padding: "4px 10px",
+                  borderRadius: 6,
+                  cursor: "pointer",
+                  fontSize: "0.8rem",
+                  fontWeight: 600,
+                  border: on ? "1px solid #2563eb" : "1px solid rgba(0,0,0,0.15)",
+                  background: on ? "#2563eb" : "#fff",
+                  color: on ? "#fff" : "#333",
+                }}
+              >
+                Sheet {s.page_index + 1}
+                {s.page_index === result.master_page_index && (
+                  <span
+                    title="Authoritative parts list"
+                    style={{
+                      fontSize: "0.6rem",
+                      background: on ? "rgba(255,255,255,0.25)" : "#e0ecff",
+                      color: on ? "#fff" : "#2563eb",
+                      padding: "1px 5px",
+                      borderRadius: 4,
+                    }}
+                  >
+                    BOM
+                  </span>
+                )}
+                {perSheet[i] > 0 && (
+                  <span
+                    style={{
+                      fontSize: "0.65rem",
+                      background: on ? "rgba(255,255,255,0.25)" : "#fde2e2",
+                      color: on ? "#fff" : "#c0392b",
+                      padding: "1px 6px",
+                      borderRadius: 10,
+                    }}
+                  >
+                    {perSheet[i]}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       <div
         className={`canvas-scroll${dragging ? " dragging" : ""}`}
         ref={scrollRef}
@@ -99,42 +182,47 @@ export default function SheetView({ result, issues, selectedId, onSelect }: Prop
         }}
       >
         <div className="sheet" style={{ width: pw * zoom, height: ph * zoom }}>
-          <img src={result.page_image} alt={`Sheet ${result.filename}`} draggable={false} />
-
+          <img
+            src={sheet.page_image}
+            alt={`Sheet ${sheet.page_index + 1} of ${result.filename}`}
+            draggable={false}
+          />
           {issues.flatMap((issue, index) =>
-            issue.targets.map((target, t) => {
-              const [x0, y0, x1, y1] = target.bbox;
-              const selected = issue.id === selectedId;
-              return (
-                <button
-                  key={`${issue.id}-${t}`}
-                  type="button"
-                  className={[
-                    "marker",
-                    target.kind === "balloon" ? "balloon" : "",
-                    `sev-${issue.severity}`,
-                    selected ? "selected" : "",
-                    selectedId && !selected ? "dimmed" : "",
-                  ]
-                    .filter(Boolean)
-                    .join(" ")}
-                  style={{
-                    left: `${((x0 - PAD) / pw) * 100}%`,
-                    top: `${((y0 - PAD) / ph) * 100}%`,
-                    width: `${((x1 - x0 + PAD * 2) / pw) * 100}%`,
-                    height: `${((y1 - y0 + PAD * 2) / ph) * 100}%`,
-                  }}
-                  title={issue.title}
-                  aria-label={`Issue ${index + 1}. ${issue.title}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onSelect(selected ? null : issue.id);
-                  }}
-                >
-                  {t === 0 && <span className="marker-tag">{index + 1}</span>}
-                </button>
-              );
-            })
+            issue.targets
+              .filter((target) => target.page === activeSheet) // only this sheet
+              .map((target, t) => {
+                const [x0, y0, x1, y1] = target.bbox;
+                const selected = issue.id === selectedId;
+                return (
+                  <button
+                    key={`${issue.id}-${t}`}
+                    type="button"
+                    className={[
+                      "marker",
+                      target.kind === "balloon" ? "balloon" : "",
+                      `sev-${issue.severity}`,
+                      selected ? "selected" : "",
+                      selectedId && !selected ? "dimmed" : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
+                    style={{
+                      left: `${((x0 - PAD) / pw) * 100}%`,
+                      top: `${((y0 - PAD) / ph) * 100}%`,
+                      width: `${((x1 - x0 + PAD * 2) / pw) * 100}%`,
+                      height: `${((y1 - y0 + PAD * 2) / ph) * 100}%`,
+                    }}
+                    title={issue.title}
+                    aria-label={`Issue ${index + 1}. ${issue.title}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSelect(selected ? null : issue.id);
+                    }}
+                  >
+                    {t === 0 && <span className="marker-tag">{index + 1}</span>}
+                  </button>
+                );
+              })
           )}
         </div>
       </div>

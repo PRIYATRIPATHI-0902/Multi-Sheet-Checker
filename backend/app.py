@@ -1,10 +1,3 @@
-"""
-app.py - FastAPI service for the assembly sheet checker.
-
-POST /api/analyze   multipart: file=<pdf>, page=<int>, use_ai=<bool>
-GET  /api/health
-Static frontend is served from ../frontend/dist when it has been built.
-"""
 from __future__ import annotations
 
 import logging
@@ -18,12 +11,10 @@ from fastapi.staticfiles import StaticFiles
 
 try:  # optional convenience: read backend/.env if python-dotenv is installed
     from dotenv import load_dotenv
-
     load_dotenv(pathlib.Path(__file__).with_name(".env"))
 except ImportError:
     pass
 
-import ai
 import extractor
 import rules
 
@@ -32,7 +23,7 @@ log = logging.getLogger("checker")
 
 MAX_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
 
-app = FastAPI(title="Assembly BOM / Balloon Checker", version="1.0")
+app = FastAPI(title="Assembly BOM / Balloon Checker", version="2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(","),
@@ -43,14 +34,26 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "ai_configured": bool(os.getenv("GEMINI_API_KEY"))}
+    return {"status": "ok"}
+
+
+def _backfill_pages(issues: list[dict], master_idx: int) -> list[dict]:
+    """Safety net only. rules.py now stamps the sheet on every target as it is
+    built, so nothing here should normally fire."""
+    for issue in issues:
+        for t in issue.get("targets", []):
+            if not isinstance(t.get("page"), int):
+                t["page"] = master_idx
+        issue["pages"] = sorted({t["page"] for t in issue.get("targets", [])})
+    return issues
 
 
 @app.post("/api/analyze")
 async def analyze(
     file: UploadFile = File(...),
+    # Ignored: every sheet in the PDF is read and reconciled. Kept so older
+    # clients keep working.
     page: int = Form(0),
-    use_ai: bool = Form(True),
 ) -> JSONResponse:
     if not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(400, "Please upload a PDF drawing.")
@@ -60,48 +63,64 @@ async def analyze(
         raise HTTPException(413, f"File is larger than {MAX_MB} MB.")
 
     try:
-        sheet = extractor.parse_sheet(data, page_index=page)
+        doc = extractor.parse_document(data, filename=file.filename or "", render=True)
     except Exception as exc:
         log.exception("parse failed")
         raise HTTPException(422, f"Could not read the drawing: {exc}")
 
-    issues = rules.run_rules(sheet)
+    issues = _backfill_pages(rules.run_rules(doc), doc.master_page_index)
 
-    ai_status, ai_message = "skipped", "AI review turned off for this run."
-    if use_ai:
-        try:
-            result = ai.review(sheet, issues)
-            issues = ai.merge(sheet, issues, result)
-            ai_status, ai_message = "ok", "Reviewed by Gemini."
-        except ai.AIUnavailable as exc:
-            ai_status = "unavailable"
-            ai_message = f"Rule checks only - {exc}"
-            log.warning("AI unavailable: %s", exc)
-        except Exception as exc:
-            ai_status = "error"
-            ai_message = f"Rule checks only - AI review failed: {exc}"
-            log.exception("AI review failed")
+    sheets_out: list[dict] = []
+    for s in doc.sheets:
+        sd = s.to_dict()
+        sd["page_image"] = f"data:image/png;base64,{s.page_image_b64}" if s.page_image_b64 else ""
+        sheets_out.append(sd)
 
     warnings: list[str] = []
-    if not sheet.balloons:
+    if not doc.balloons:
         warnings.append(
-            "No balloons were detected. The checker looks for small circles containing a "
-            "number; if the sheet is a scan or the balloon text is outlined, nothing is found."
+            "No balloons were found on any sheet. The checker looks for a small outline "
+            "with a number inside it; a scanned sheet or outlined text reads as empty."
         )
-    if not sheet.bom_rows:
+    if not doc.bom_rows:
         warnings.append(
-            "No parts list was detected. A table with ITEM and QTY column headings is required."
+            "No parts list was found on any sheet. A table with ITEM and QTY headings is required."
         )
+    if len(doc.sheets) > 1:
+        warnings.append(
+            f"{len(doc.sheets)} sheets were read. The parts list on sheet "
+            f"{doc.master_page_index + 1} is treated as authoritative, and balloons from every "
+            "sheet are checked against it."
+        )
+    if doc.split_inferred:
+        warnings.append(
+            "Split balloons were assumed: several balloons carry a per-place quantity that adds "
+            "up to the parts-list quantity. Add a note on the sheet to make this explicit."
+        )
+    low = sum(1 for b in doc.balloons if b.confidence == "low")
+    if low:
+        warnings.append(
+            f"{low} callout(s) were read from plain text with no outline drawn around them. "
+            "They are included in the checks — confirm them by eye."
+        )
+
+    master = sheets_out[doc.master_page_index] if sheets_out else None
 
     return JSONResponse({
         "filename": file.filename,
-        "page": page,
-        "sheet": sheet.to_dict(),
-        "page_image": f"data:image/png;base64,{sheet.page_image_b64}",
+        "master_page_index": doc.master_page_index,
+        "sheets": sheets_out,
         "issues": issues,
         "summary": rules.summarise(issues),
-        "ai": {"status": ai_status, "message": ai_message},
+        "split_balloons": doc.split_balloons,
+        "split_inferred": doc.split_inferred,
+        # Kept for frontend compatibility; the app no longer calls any AI service.
+        "ai": {"status": "skipped", "message": "Rule checks only (AI review disabled)."},
         "warnings": warnings,
+        # ---- backwards-compatible single-sheet fields (point at the master) ---
+        "page": doc.master_page_index,
+        "sheet": master,
+        "page_image": master["page_image"] if master else "",
     })
 
 

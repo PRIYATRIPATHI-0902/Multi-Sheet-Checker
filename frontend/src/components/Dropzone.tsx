@@ -72,10 +72,7 @@ export default function Dropzone({ onFile, error }: Props) {
               <dt>Checks</dt>
               <dd>Python rules</dd>
             </div>
-            <div>
-              <dt>Explains</dt>
-              <dd>Gemini</dd>
-            </div>
+
           </dl>
         </div>
       </div>

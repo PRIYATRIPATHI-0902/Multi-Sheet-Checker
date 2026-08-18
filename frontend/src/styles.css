@@ -1,8 +1,3 @@
-/* ------------------------------------------------------------------
-   Sheet Check
-   Visual language borrowed from a check print: drafting lettering,
-   hairline rules, a title-block stamp, and red pencil over the sheet.
-   ------------------------------------------------------------------ */
 
 :root {
   --ink: #15181b;
@@ -22,8 +17,8 @@
   --amber-wash: rgba(160, 103, 20, 0.12);
   --steel: #3a6580;
   --steel-wash: rgba(58, 101, 128, 0.12);
-
-  --display: "Barlow Condensed", "Arial Narrow", sans-serif;
+/* "Barlow Condensed", "Arial", */
+  --display:  sans-serif;
   --body: "IBM Plex Sans", system-ui, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, monospace;
 
@@ -423,7 +418,7 @@ button {
 /* title-block strip along the bottom of the empty sheet */
 .drop-tb {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   border: 1px solid var(--rule);
   border-bottom: 0;
 }

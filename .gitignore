@@ -1,5 +1,24 @@
+cat > .gitignore <<'EOF'
+# Node
 node_modules/
-dist/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+
+# Python
 __pycache__/
+*.py[cod]
 .venv/
-.env
+venv/
+backend/.venv/
+
+
+
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+EOF

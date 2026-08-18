@@ -7,17 +7,19 @@ import type { AnalysisResult } from "./types";
 export const API_BASE =
   window.location.port === "3000" ? "http://localhost:8000" : "";
 
+/**
+ * Analyze a drawing. The whole PDF (every sheet) is now read and reconciled
+ * server-side, so no page index is required. The `opts` argument is optional
+ * and ignored, kept only so existing callers keep compiling.
+ */
 export async function analyze(
   file: File,
-  opts: { page: number; useAi: boolean }
+  _opts?: { page?: number }
 ): Promise<AnalysisResult> {
   const form = new FormData();
   form.append("file", file);
-  form.append("page", String(opts.page));
-  form.append("use_ai", String(opts.useAi));
 
   const res = await fetch(`${API_BASE}/api/analyze`, { method: "POST", body: form });
-
   if (!res.ok) {
     let message = `The server returned ${res.status}.`;
     try {

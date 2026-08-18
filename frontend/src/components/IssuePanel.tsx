@@ -8,6 +8,7 @@ interface Props {
   onToggleFilter: (s: Severity) => void;
   selectedId: string | null;
   onSelect: (id: string | null) => void;
+  activeSheet?: number; // highlight issues on the current sheet
 }
 
 const SEVERITY_LABEL: Record<Severity, string> = {
@@ -23,6 +24,7 @@ export default function IssuePanel({
   onToggleFilter,
   selectedId,
   onSelect,
+  activeSheet,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -34,8 +36,15 @@ export default function IssuePanel({
       ?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }, [selectedId]);
 
-  const { summary, ai, sheet } = result;
+  const { summary, ai } = result;
   const clean = summary.error === 0 && summary.warning === 0;
+
+  // Document-wide figures (across every sheet) with the master as fallback.
+  const sheets = result.sheets ?? [result.sheet];
+  const master = sheets[result.master_page_index] ?? result.sheet;
+  const totalBalloons = sheets.reduce((n, s) => n + s.balloons.length, 0);
+  const bomRowCount = master.bom_rows.length;
+  const drawingNo = master.title_block?.drawing_no ?? "\u2014";
 
   return (
     <aside className="sidebar">
@@ -54,28 +63,26 @@ export default function IssuePanel({
             <dd className="mono">{String(summary.info).padStart(2, "0")}</dd>
           </div>
         </div>
-
         <div className="stamp-row">
           <div className="stamp-cell">
             <dt>Balloons</dt>
             <dd className="mono" style={{ fontSize: "1rem" }}>
-              {sheet.balloons.length}
+              {totalBalloons}
             </dd>
           </div>
           <div className="stamp-cell">
             <dt>Parts list rows</dt>
             <dd className="mono" style={{ fontSize: "1rem" }}>
-              {sheet.bom_rows.length}
+              {bomRowCount}
             </dd>
           </div>
           <div className="stamp-cell">
-            <dt>Drawing no.</dt>
-            <dd className="mono" style={{ fontSize: "0.85rem" }}>
-              {sheet.title_block.drawing_no ?? "\u2014"}
+            <dt>{sheets.length > 1 ? "Sheets" : "Drawing no."}</dt>
+            <dd className="mono" style={{ fontSize: sheets.length > 1 ? "1rem" : "0.85rem" }}>
+              {sheets.length > 1 ? sheets.length : drawingNo}
             </dd>
           </div>
         </div>
-
         <div className="stamp-verdict">
           <span className={`verdict-text ${clean ? "pass" : "fail"}`}>
             {clean ? "No blocking issues" : "Not ready to release"}
@@ -127,6 +134,10 @@ export default function IssuePanel({
         ) : (
           issues.map((issue, index) => {
             const selected = issue.id === selectedId;
+            const issuePage = issue.targets[0]?.page;
+            const onThisSheet =
+              typeof activeSheet === "number" &&
+              issue.targets.some((t) => t.page === activeSheet);
             return (
               <button
                 key={issue.id}
@@ -140,13 +151,19 @@ export default function IssuePanel({
                   <span className="issue-index mono">{index + 1}</span>
                   <span className="issue-title">{issue.title}</span>
                 </span>
-
                 <span className="issue-meta">
                   <span className="tag">{issue.code}</span>
                   {issue.item && <span className="tag">Item {issue.item}</span>}
+                  {(sheets.length > 1 && typeof issuePage === "number") && (
+                    <span
+                      className="tag"
+                      style={onThisSheet ? { background: "#2563eb", color: "#fff" } : undefined}
+                    >
+                      Sheet {issuePage + 1}
+                    </span>
+                  )}
                   {issue.source !== "rule" && <span className="tag ai">AI</span>}
                 </span>
-
                 {selected && (
                   <span className="issue-detail">
                     <p>{issue.detail}</p>
